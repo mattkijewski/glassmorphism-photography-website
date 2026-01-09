@@ -1,0 +1,1338 @@
+import fs from 'fs';
+import path from 'path';
+import { execSync, spawnSync } from 'child_process';
+
+const PRD = JSON.parse(process.env.PRD_JSON || '{}');
+const PROJECT_ID = process.env.PROJECT_ID;
+const CALLBACK_URL = process.env.CALLBACK_URL;
+const AI_PROVIDER = process.env.AI_PROVIDER || 'anthropic';
+const BACKTICKS = String.fromCharCode(96, 96, 96);
+const BACKTICK = String.fromCharCode(96);
+const MAX_FIX_ATTEMPTS = 5;
+
+async function updateStatus(status, message, storyId = null, prUrl = null) {
+  console.log('[STATUS] ' + status + ': ' + message + (prUrl ? ' PR: ' + prUrl : ''));
+  if (CALLBACK_URL) {
+    try {
+      await fetch(CALLBACK_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectId: PROJECT_ID, status, message, storyId, prUrl }),
+      });
+    } catch (e) {
+      console.error('Failed to send status update:', e.message);
+    }
+  }
+}
+
+// Detect project type and return appropriate build/check commands
+function detectProjectType() {
+  const hasPackageJson = fs.existsSync('package.json');
+  const hasYarnLock = fs.existsSync('yarn.lock');
+  const hasPnpmLock = fs.existsSync('pnpm-lock.yaml');
+  const hasBunLock = fs.existsSync('bun.lockb');
+  const hasRequirements = fs.existsSync('requirements.txt');
+  const hasPyproject = fs.existsSync('pyproject.toml');
+  const hasCargoToml = fs.existsSync('Cargo.toml');
+  const hasGoMod = fs.existsSync('go.mod');
+
+  // Check for iOS/macOS/Swift projects
+  const xcodeProjects = fs.readdirSync('.').filter(function(f) {
+    return f.endsWith('.xcodeproj') || f.endsWith('.xcworkspace');
+  });
+  const hasSwiftPackage = fs.existsSync('Package.swift');
+  const hasPodfile = fs.existsSync('Podfile');
+
+  if (xcodeProjects.length > 0 || hasSwiftPackage) {
+    const projectName = xcodeProjects[0] ? xcodeProjects[0].replace(/\.(xcodeproj|xcworkspace)$/, '') : 'App';
+    return {
+      type: 'ios',
+      platform: 'apple',
+      projectName: projectName,
+      hasWorkspace: xcodeProjects.some(function(f) { return f.endsWith('.xcworkspace'); }),
+      hasPods: hasPodfile,
+      hasSwiftPackage: hasSwiftPackage,
+      installCmd: hasPodfile ? 'pod install' : '',
+      checkCmds: [],
+    };
+  }
+
+  // Check for Android projects
+  const hasGradle = fs.existsSync('build.gradle') || fs.existsSync('build.gradle.kts');
+  const hasAndroidManifest = fs.existsSync('app/src/main/AndroidManifest.xml');
+  if (hasGradle && hasAndroidManifest) {
+    return {
+      type: 'android',
+      platform: 'android',
+      installCmd: '',
+      checkCmds: ['./gradlew assembleDebug'],
+    };
+  }
+
+  // Check for Flutter projects
+  const hasPubspec = fs.existsSync('pubspec.yaml');
+  if (hasPubspec) {
+    return {
+      type: 'flutter',
+      platform: 'cross-platform',
+      installCmd: 'flutter pub get',
+      checkCmds: ['flutter analyze', 'flutter build apk --debug'],
+    };
+  }
+
+  // Check for React Native projects
+  if (hasPackageJson) {
+    const pkg = JSON.parse(fs.readFileSync('package.json', 'utf-8'));
+    if (pkg.dependencies && pkg.dependencies['react-native']) {
+      const pm = hasBunLock ? 'bun' : hasPnpmLock ? 'pnpm' : hasYarnLock ? 'yarn' : 'npm';
+      return {
+        type: 'react-native',
+        platform: 'cross-platform',
+        packageManager: pm,
+        hasIos: fs.existsSync('ios'),
+        hasAndroid: fs.existsSync('android'),
+        installCmd: pm + ' install',
+        checkCmds: [pm + ' run lint'],
+      };
+    }
+  }
+
+  if (hasPackageJson) {
+    const pkg = JSON.parse(fs.readFileSync('package.json', 'utf-8'));
+    const pm = hasBunLock ? 'bun' : hasPnpmLock ? 'pnpm' : hasYarnLock ? 'yarn' : 'npm';
+    const scripts = pkg.scripts || {};
+
+    // Determine check commands based on available scripts
+    const checks = [];
+    if (scripts.typecheck) checks.push(pm + ' run typecheck');
+    else if (scripts['type-check']) checks.push(pm + ' run type-check');
+    else if (pkg.devDependencies?.typescript || pkg.dependencies?.typescript) {
+      checks.push(pm + (pm === 'npm' ? ' exec' : '') + ' tsc --noEmit');
+    }
+
+    if (scripts.lint) checks.push(pm + ' run lint');
+    if (scripts.build) checks.push(pm + ' run build');
+    else if (scripts.compile) checks.push(pm + ' run compile');
+
+    return {
+      type: 'node',
+      packageManager: pm,
+      installCmd: pm + ' install',
+      checkCmds: checks.length > 0 ? checks : [pm + ' run build'],
+    };
+  }
+
+  if (hasRequirements || hasPyproject) {
+    return {
+      type: 'python',
+      installCmd: hasPyproject ? 'pip install -e .' : 'pip install -r requirements.txt',
+      checkCmds: ['python -m py_compile *.py'],
+    };
+  }
+
+  if (hasCargoToml) {
+    return { type: 'rust', installCmd: '', checkCmds: ['cargo check', 'cargo clippy'] };
+  }
+
+  if (hasGoMod) {
+    return { type: 'go', installCmd: 'go mod download', checkCmds: ['go build ./...', 'go vet ./...'] };
+  }
+
+  return { type: 'unknown', installCmd: '', checkCmds: [] };
+}
+
+// Check for Next.js routing conflicts (pages/ vs app/ router)
+function checkNextJsConflicts() {
+  const conflicts = [];
+
+  // Next.js can't have both pages/ and app/ routers with conflicting routes
+  const hasAppDir = fs.existsSync('app') || fs.existsSync('src/app');
+  const hasPagesDir = fs.existsSync('pages') || fs.existsSync('src/pages');
+
+  if (hasAppDir && hasPagesDir) {
+    const appDir = fs.existsSync('src/app') ? 'src/app' : 'app';
+    const pagesDir = fs.existsSync('src/pages') ? 'src/pages' : 'pages';
+
+    // Check for specific conflicting routes
+    const routeConflicts = [
+      { pages: 'index', app: 'page' },
+      { pages: '_app', app: 'layout' },
+      { pages: '_document', app: 'layout' },
+    ];
+
+    const extensions = ['.tsx', '.ts', '.jsx', '.js'];
+
+    for (const conflict of routeConflicts) {
+      for (const ext of extensions) {
+        const pagesFile = path.join(pagesDir, conflict.pages + ext);
+        const appFile = path.join(appDir, conflict.app + ext);
+
+        if (fs.existsSync(pagesFile) && fs.existsSync(appFile)) {
+          conflicts.push({ pagesFile, appFile });
+        }
+      }
+    }
+  }
+
+  return conflicts;
+}
+
+// Resolve Next.js routing conflicts by removing pages/ versions
+function resolveNextJsConflicts(conflicts) {
+  if (conflicts.length === 0) return;
+
+  console.log('Resolving Next.js routing conflicts...');
+  for (const conflict of conflicts) {
+    console.log('Removing conflicting file: ' + conflict.pagesFile + ' (keeping ' + conflict.appFile + ')');
+    try {
+      fs.unlinkSync(conflict.pagesFile);
+    } catch (e) {
+      console.log('Could not remove ' + conflict.pagesFile + ': ' + e.message);
+    }
+  }
+
+  // Check if pages directory is now empty and remove it
+  const pagesDir = fs.existsSync('src/pages') ? 'src/pages' : 'pages';
+  if (fs.existsSync(pagesDir)) {
+    try {
+      const remaining = fs.readdirSync(pagesDir);
+      // If only _app, _document, or api routes remain, keep pages dir
+      // If completely empty, remove it
+      if (remaining.length === 0) {
+        fs.rmdirSync(pagesDir);
+        console.log('Removed empty pages directory');
+      }
+    } catch (e) {}
+  }
+}
+
+// Run build/lint/typecheck and return errors if any
+function runChecks(projectInfo) {
+  const errors = [];
+
+  for (const cmd of projectInfo.checkCmds) {
+    console.log('Running: ' + cmd);
+    try {
+      const result = spawnSync(cmd, { shell: true, encoding: 'utf-8', timeout: 120000 });
+      if (result.status !== 0) {
+        const errorOutput = (result.stderr || '') + (result.stdout || '');
+        errors.push({ command: cmd, output: errorOutput.slice(-3000) }); // Last 3000 chars
+      } else {
+        console.log('PASSED: ' + cmd);
+      }
+    } catch (e) {
+      errors.push({ command: cmd, output: e.message });
+    }
+  }
+
+  return errors;
+}
+
+// Find related files based on error patterns (for better fix context)
+function findRelatedFiles(errors, changes) {
+  const relatedFiles = new Set();
+  const allFiles = getSourceFiles();
+  const errorText = errors.map(function(e) { return e.output; }).join('\n');
+
+  // Look for patterns in errors
+  const patterns = {
+    // Theme/colors errors
+    colors: ['theme', 'colors', 'palette', 'styles', 'tokens'],
+    // Import errors - find the source file
+    imports: [],
+    // Type errors - find type definition files
+    types: ['types', 'interfaces', '.d.ts'],
+    // Component errors
+    components: ['components', 'ui'],
+  };
+
+  // Check for color/theme related errors
+  if (errorText.includes('colors') || errorText.includes('theme') || errorText.includes('palette')) {
+    allFiles.forEach(function(f) {
+      if (f.includes('theme') || f.includes('colors') || f.includes('tokens') || f.includes('palette')) {
+        relatedFiles.add(f);
+      }
+    });
+  }
+
+  // Check for undefined property errors and find the source
+  const propMatch = errorText.match(/Cannot read propert(?:y|ies) ['"]?(\w+)['"]? of undefined/g);
+  if (propMatch) {
+    // Find files that might define these properties
+    allFiles.forEach(function(f) {
+      if (f.includes('types') || f.includes('constants') || f.includes('config')) {
+        relatedFiles.add(f);
+      }
+    });
+  }
+
+  // Find files imported by the changed files
+  changes.forEach(function(change) {
+    try {
+      const content = fs.readFileSync(change.path, 'utf-8');
+      const importMatches = content.match(/from ['"]([^'"]+)['"]/g) || [];
+      importMatches.forEach(function(imp) {
+        const importPath = imp.replace(/from ['"]|['"]/g, '');
+        // Find matching file
+        allFiles.forEach(function(f) {
+          if (f.includes(importPath.replace(/^[.@\/]+/, '').split('/').pop())) {
+            relatedFiles.add(f);
+          }
+        });
+      });
+    } catch (e) {}
+  });
+
+  // Extract file paths mentioned in errors
+  const filePathMatches = errorText.match(/(?:src|app|lib|components|utils|hooks|styles|theme)[/\\][\w/\\.-]+\.\w+/g) || [];
+  filePathMatches.forEach(function(p) {
+    const normalized = p.replace(/\\/g, '/');
+    allFiles.forEach(function(f) {
+      if (f.includes(normalized) || f.endsWith(normalized)) {
+        relatedFiles.add(f);
+      }
+    });
+  });
+
+  // Limit to 10 most relevant files (excluding already changed files)
+  const changedPaths = changes.map(function(c) { return c.path; });
+  return Array.from(relatedFiles)
+    .filter(function(f) { return !changedPaths.includes(f); })
+    .slice(0, 10);
+}
+
+function getSourceFiles(dir = '.', files = []) {
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  for (const entry of entries) {
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (['node_modules', '.git', 'dist', 'build', '.next', 'coverage', '__pycache__', 'venv', '.expo'].includes(entry.name)) continue;
+      getSourceFiles(fullPath, files);
+    } else {
+      const ext = path.extname(entry.name).toLowerCase();
+      if (['.js', '.jsx', '.ts', '.tsx', '.py', '.go', '.rs', '.java', '.rb', '.php', '.vue', '.svelte', '.css', '.scss', '.html', '.json', '.yaml', '.yml', '.md', '.sql'].includes(ext)) {
+        files.push(fullPath);
+      }
+    }
+  }
+  return files;
+}
+
+function readFileContent(filePath, maxSize = 50000) {
+  try {
+    const stats = fs.statSync(filePath);
+    if (stats.size > maxSize) return '[File too large: ' + stats.size + ' bytes]';
+    return fs.readFileSync(filePath, 'utf-8');
+  } catch (e) {
+    return '[Error reading file: ' + e.message + ']';
+  }
+}
+
+function buildCodebaseContext() {
+  const files = getSourceFiles();
+  let context = '## Current Codebase Structure\n\n';
+  context += '### File Tree\n' + BACKTICKS + '\n' + files.join('\n') + '\n' + BACKTICKS + '\n\n';
+  context += '### Key Files\n\n';
+  const keyFiles = files.slice(0, 30);
+  for (const file of keyFiles) {
+    const content = readFileContent(file, 30000);
+    context += '#### ' + file + '\n' + BACKTICKS + '\n' + content + '\n' + BACKTICKS + '\n\n';
+  }
+  return context;
+}
+
+// Code implementation uses powerful models (Sonnet/GPT-4/Gemini Pro)
+async function callAI(prompt, systemPrompt) {
+  if (AI_PROVIDER === 'anthropic') {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 8192,
+        system: systemPrompt,
+        messages: [{ role: 'user', content: prompt }],
+      }),
+    });
+    const data = await response.json();
+    if (data.error) throw new Error(data.error.message);
+    return data.content[0].text;
+  } else if (AI_PROVIDER === 'openai') {
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + process.env.OPENAI_API_KEY,
+      },
+      body: JSON.stringify({
+        model: 'gpt-4-turbo-preview',
+        max_tokens: 8192,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: prompt },
+        ],
+      }),
+    });
+    const data = await response.json();
+    if (data.error) throw new Error(data.error.message);
+    return data.choices[0].message.content;
+  } else if (AI_PROVIDER === 'google') {
+    const response = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key=' + process.env.GOOGLE_API_KEY, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: systemPrompt + '\n\n' + prompt }] }],
+        generationConfig: { maxOutputTokens: 8192 },
+      }),
+    });
+    const data = await response.json();
+    if (data.error) throw new Error(data.error.message);
+    return data.candidates[0].content.parts[0].text;
+  }
+  throw new Error('Unknown AI provider: ' + AI_PROVIDER);
+}
+
+function parseFileChanges(response) {
+  const changes = [];
+  const fileBlockRegex = new RegExp(BACKTICKS + '(?:[\\w]+)?\\s*\\n\\/\\/\\s*FILE:\\s*(.+?)\\n([\\s\\S]*?)' + BACKTICKS, 'g');
+  const altFileBlockRegex = new RegExp('###\\s*(.+?)\\n' + BACKTICKS + '(?:[\\w]+)?\\n([\\s\\S]*?)' + BACKTICKS, 'g');
+  let match;
+  while ((match = fileBlockRegex.exec(response)) !== null) {
+    changes.push({ path: match[1].trim(), content: match[2].trim() });
+  }
+  if (changes.length === 0) {
+    while ((match = altFileBlockRegex.exec(response)) !== null) {
+      const filePath = match[1].trim().replace(new RegExp('^' + BACKTICK + '|' + BACKTICK + '$', 'g'), '');
+      if (filePath.includes('.')) {
+        changes.push({ path: filePath, content: match[2].trim() });
+      }
+    }
+  }
+  return changes;
+}
+
+function applyChanges(changes) {
+  for (const change of changes) {
+    console.log('Writing: ' + change.path);
+    const dir = path.dirname(change.path);
+    if (dir !== '.') {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.writeFileSync(change.path, change.content);
+  }
+}
+
+function generateNextSteps(plan, projectInfo, successfulStories, failedStories) {
+  const projectName = plan.project_name || plan.project || 'Your Project';
+  const date = new Date().toISOString().split('T')[0];
+
+  let content = '# Next Steps for ' + projectName + '\n\n';
+  content += '> Generated by Jake AI Agent on ' + date + '\n\n';
+
+  content += '## Implementation Summary\n\n';
+  content += '| Metric | Value |\n';
+  content += '|--------|-------|\n';
+  content += '| Stories Completed | ' + successfulStories.length + ' |\n';
+  if (failedStories.length > 0) {
+    content += '| Stories Needing Attention | ' + failedStories.length + ' |\n';
+  }
+  content += '| Project Type | ' + projectInfo.type + ' |\n\n';
+
+  if (failedStories.length > 0) {
+    content += '## Manual Implementation Needed\n\n';
+    content += 'The following stories could not be automatically implemented:\n\n';
+    failedStories.forEach(function(story) {
+      content += '- [ ] **' + story.id + '**: ' + story.title + '\n';
+      content += '  - ' + story.description + '\n';
+    });
+    content += '\n';
+  }
+
+  // iOS/Xcode specific section
+  if (projectInfo.type === 'ios') {
+    content += '## Opening the Project in Xcode\n\n';
+    content += '### First Time Setup\n\n';
+    content += '1. **Clone the repository:**\n';
+    content += '   ' + BACKTICKS + 'bash\n';
+    content += '   git clone <repository-url>\n';
+    content += '   cd ' + (projectInfo.projectName || projectName) + '\n';
+    content += '   ' + BACKTICKS + '\n\n';
+
+    if (projectInfo.hasPods) {
+      content += '2. **Install CocoaPods dependencies:**\n';
+      content += '   ' + BACKTICKS + 'bash\n';
+      content += '   pod install\n';
+      content += '   ' + BACKTICKS + '\n\n';
+      content += '3. **Open the workspace (NOT the .xcodeproj):**\n';
+      content += '   ' + BACKTICKS + 'bash\n';
+      content += '   open ' + (projectInfo.projectName || projectName) + '.xcworkspace\n';
+      content += '   ' + BACKTICKS + '\n\n';
+    } else {
+      content += '2. **Open the project:**\n';
+      content += '   ' + BACKTICKS + 'bash\n';
+      content += '   open ' + (projectInfo.projectName || projectName) + '.xcodeproj\n';
+      content += '   ' + BACKTICKS + '\n\n';
+    }
+
+    content += '### Troubleshooting Xcode Issues\n\n';
+    content += '#### "Project is damaged and cannot be opened"\n\n';
+    content += 'This error usually means the project.pbxproj file has issues. Try these fixes:\n\n';
+    content += '**Option 1: Reset Xcode derived data**\n';
+    content += BACKTICKS + 'bash\n';
+    content += 'rm -rf ~/Library/Developer/Xcode/DerivedData\n';
+    content += 'rm -rf ' + (projectInfo.projectName || projectName) + '.xcodeproj/project.xcworkspace\n';
+    content += BACKTICKS + '\n\n';
+
+    content += '**Option 2: Regenerate project file**\n';
+    content += 'If the project uses Swift Package Manager:\n';
+    content += BACKTICKS + 'bash\n';
+    content += 'swift package generate-xcodeproj\n';
+    content += BACKTICKS + '\n\n';
+
+    content += '**Option 3: Fix project.pbxproj manually**\n';
+    content += '1. Open ' + BACKTICK + (projectInfo.projectName || projectName) + '.xcodeproj/project.pbxproj' + BACKTICK + ' in a text editor\n';
+    content += '2. Look for duplicate entries or missing references\n';
+    content += '3. Check for files referenced but not in the repo\n';
+    content += '4. Ensure all PBXFileReference entries have valid buildPhase associations\n\n';
+
+    content += '**Option 4: Create a fresh project and migrate**\n';
+    content += '1. Create a new Xcode project with the same name\n';
+    content += '2. Copy your Swift/source files into the new project\n';
+    content += '3. Re-add any dependencies\n\n';
+
+    content += '#### "unrecognized selector sent to instance"\n\n';
+    content += 'This error in the project file usually means:\n';
+    content += '- A file reference is pointing to a non-existent file\n';
+    content += '- Build phases have invalid references\n';
+    content += '- The project file has merge conflicts\n\n';
+    content += 'Fix: Check for merge conflict markers (' + BACKTICK + '<<<<' + BACKTICK + ', ' + BACKTICK + '====' + BACKTICK + ', ' + BACKTICK + '>>>>' + BACKTICK + ') in project.pbxproj\n\n';
+
+    content += '#### Build Errors\n\n';
+    content += '- **Missing frameworks**: Product > Clean Build Folder (Cmd+Shift+K)\n';
+    content += '- **Provisioning issues**: Xcode > Preferences > Accounts > Manage Certificates\n';
+    content += '- **Swift version mismatch**: Check Build Settings > Swift Language Version\n\n';
+
+    content += '## Running on Device/Simulator\n\n';
+    content += '1. Select your target device from the scheme dropdown\n';
+    content += '2. Press Cmd+R or click the Play button\n';
+    content += '3. For physical devices, ensure you have a valid provisioning profile\n\n';
+
+    content += '## Publishing to App Store\n\n';
+    content += '### Pre-Submission Checklist\n\n';
+    content += '- [ ] App icons for all required sizes\n';
+    content += '- [ ] Launch screen configured\n';
+    content += '- [ ] Privacy descriptions in Info.plist (camera, location, etc.)\n';
+    content += '- [ ] App Store screenshots prepared\n';
+    content += '- [ ] Version and build number set\n';
+    content += '- [ ] Archive built and validated\n\n';
+
+    content += '### Submission Steps\n\n';
+    content += '1. **Create an Archive:**\n';
+    content += '   - Product > Archive\n';
+    content += '   - Wait for the build to complete\n\n';
+    content += '2. **Distribute the App:**\n';
+    content += '   - Window > Organizer\n';
+    content += '   - Select your archive\n';
+    content += '   - Click "Distribute App"\n';
+    content += '   - Choose "App Store Connect"\n\n';
+    content += '3. **Complete in App Store Connect:**\n';
+    content += '   - Add app metadata and screenshots\n';
+    content += '   - Submit for review\n\n';
+
+  } else if (projectInfo.type === 'android') {
+    content += '## Opening in Android Studio\n\n';
+    content += '1. Open Android Studio\n';
+    content += '2. Select "Open an existing project"\n';
+    content += '3. Navigate to the cloned repository\n';
+    content += '4. Wait for Gradle sync to complete\n\n';
+
+    content += '### Troubleshooting\n\n';
+    content += '- **Gradle sync failed**: File > Invalidate Caches and Restart\n';
+    content += '- **SDK not found**: Check local.properties has correct sdk.dir\n';
+    content += '- **Build tools missing**: SDK Manager > SDK Tools > Install required\n\n';
+
+    content += '## Publishing to Play Store\n\n';
+    content += '1. Build > Generate Signed Bundle/APK\n';
+    content += '2. Create or select your keystore\n';
+    content += '3. Upload to Google Play Console\n\n';
+
+  } else if (projectInfo.type === 'flutter') {
+    content += '## Running the Flutter App\n\n';
+    content += BACKTICKS + 'bash\n';
+    content += '# Get dependencies\n';
+    content += 'flutter pub get\n\n';
+    content += '# Run on connected device/emulator\n';
+    content += 'flutter run\n\n';
+    content += '# Run on specific device\n';
+    content += 'flutter devices  # List devices\n';
+    content += 'flutter run -d <device_id>\n';
+    content += BACKTICKS + '\n\n';
+
+    content += '### Building for Release\n\n';
+    content += BACKTICKS + 'bash\n';
+    content += '# iOS\n';
+    content += 'flutter build ios --release\n\n';
+    content += '# Android\n';
+    content += 'flutter build apk --release\n';
+    content += 'flutter build appbundle --release\n';
+    content += BACKTICKS + '\n\n';
+
+  } else if (projectInfo.type === 'react-native') {
+    content += '## Running React Native\n\n';
+    content += BACKTICKS + 'bash\n';
+    content += '# Install dependencies\n';
+    content += (projectInfo.packageManager || 'npm') + ' install\n\n';
+    content += '# iOS (requires Mac)\n';
+    content += 'cd ios && pod install && cd ..\n';
+    content += (projectInfo.packageManager || 'npm') + ' run ios\n\n';
+    content += '# Android\n';
+    content += (projectInfo.packageManager || 'npm') + ' run android\n';
+    content += BACKTICKS + '\n\n';
+
+    content += '### Troubleshooting\n\n';
+    content += '- **Metro bundler issues**: ' + BACKTICK + 'npx react-native start --reset-cache' + BACKTICK + '\n';
+    content += '- **iOS pod issues**: ' + BACKTICK + 'cd ios && pod deintegrate && pod install' + BACKTICK + '\n';
+    content += '- **Android build failed**: Clean and rebuild with ' + BACKTICK + 'cd android && ./gradlew clean' + BACKTICK + '\n\n';
+
+  } else if (projectInfo.type === 'node') {
+    content += '## Running Locally\n\n';
+    content += BACKTICKS + 'bash\n';
+    content += '# Install dependencies\n';
+    content += (projectInfo.packageManager || 'npm') + ' install\n\n';
+    content += '# Start development server\n';
+    content += (projectInfo.packageManager || 'npm') + ' run dev\n';
+    content += BACKTICKS + '\n\n';
+
+    content += '## Deployment Options\n\n';
+    content += '### Vercel (Recommended for Next.js)\n';
+    content += BACKTICKS + 'bash\n';
+    content += 'npm i -g vercel\n';
+    content += 'vercel --prod\n';
+    content += BACKTICKS + '\n\n';
+
+    content += '### Netlify\n';
+    content += BACKTICKS + 'bash\n';
+    content += 'npm i -g netlify-cli\n';
+    content += 'netlify deploy --prod\n';
+    content += BACKTICKS + '\n\n';
+
+    content += '### Docker\n';
+    content += BACKTICKS + 'dockerfile\n';
+    content += 'FROM node:20-alpine\n';
+    content += 'WORKDIR /app\n';
+    content += 'COPY package*.json ./\n';
+    content += 'RUN npm ci --only=production\n';
+    content += 'COPY . .\n';
+    content += 'RUN npm run build\n';
+    content += 'CMD ["npm", "start"]\n';
+    content += BACKTICKS + '\n\n';
+
+    content += '### Troubleshooting\n\n';
+    content += '- **Port already in use**: Kill process on port or use different port\n';
+    content += '- **Module not found**: Delete node_modules and reinstall\n';
+    content += '- **TypeScript errors**: Run ' + BACKTICK + 'npx tsc --noEmit' + BACKTICK + ' to see all errors\n\n';
+
+  } else if (projectInfo.type === 'python') {
+    content += '## Running Locally\n\n';
+    content += BACKTICKS + 'bash\n';
+    content += '# Create virtual environment\n';
+    content += 'python -m venv venv\n';
+    content += 'source venv/bin/activate  # Windows: venv\\Scripts\\activate\n\n';
+    content += '# Install dependencies\n';
+    content += 'pip install -r requirements.txt\n\n';
+    content += '# Run the application\n';
+    content += 'python main.py  # or python -m your_module\n';
+    content += BACKTICKS + '\n\n';
+
+    content += '## Deployment Options\n\n';
+    content += '- **Heroku**: ' + BACKTICK + 'git push heroku main' + BACKTICK + '\n';
+    content += '- **Railway/Render**: Connect GitHub repo in dashboard\n';
+    content += '- **Docker**: Create Dockerfile with Python base image\n\n';
+
+  } else {
+    content += '## Getting Started\n\n';
+    content += '1. Clone the repository\n';
+    content += '2. Follow any setup instructions in the code\n';
+    content += '3. Build and run the project\n\n';
+  }
+
+  content += '## Pre-Launch Checklist\n\n';
+  content += '- [ ] All features tested and working\n';
+  content += '- [ ] Error handling in place\n';
+  content += '- [ ] Performance tested\n';
+  content += '- [ ] Security review completed\n';
+  content += '- [ ] Documentation updated\n';
+  content += '- [ ] Analytics/monitoring set up\n\n';
+
+  content += '## Getting Help\n\n';
+  content += 'If you encounter issues:\n\n';
+  content += '1. **Check this document** for platform-specific troubleshooting\n';
+  content += '2. **Search the error message** online\n';
+  content += '3. **Check GitHub Issues** for similar problems\n';
+  content += '4. **Ask in developer communities** (Stack Overflow, Discord, etc.)\n\n';
+
+  content += '---\n';
+  content += '*This document was auto-generated by [FluxGen](https://fluxgen.app) - AI-Powered Development*\n';
+
+  return content;
+}
+
+async function generateReadme(plan, projectInfo, successfulStories, existingReadme) {
+  const projectName = plan.project_name || plan.project || 'Project';
+  const description = plan.description || 'A project built with FluxGen AI.';
+
+  // Helper to generate quick start instructions
+  function getQuickStartInstructions() {
+    let instructions = '\n\n## Quick Start\n\n';
+
+    if (projectInfo.type === 'node') {
+      instructions += BACKTICKS + 'bash\n';
+      instructions += '# Install dependencies\n';
+      instructions += (projectInfo.packageManager || 'npm') + ' install\n\n';
+      instructions += '# Run development server\n';
+      instructions += (projectInfo.packageManager || 'npm') + ' run dev\n\n';
+      instructions += '# Build for production\n';
+      instructions += (projectInfo.packageManager || 'npm') + ' run build\n\n';
+      instructions += '# Start production server\n';
+      instructions += (projectInfo.packageManager || 'npm') + ' start\n';
+      instructions += BACKTICKS + '\n\n';
+      instructions += 'The development server runs at ' + BACKTICK + 'http://localhost:3000' + BACKTICK + ' by default.\n';
+    } else if (projectInfo.type === 'python') {
+      instructions += BACKTICKS + 'bash\n';
+      instructions += '# Create virtual environment\n';
+      instructions += 'python -m venv venv\n';
+      instructions += 'source venv/bin/activate  # Windows: venv\\Scripts\\activate\n\n';
+      instructions += '# Install dependencies\n';
+      instructions += 'pip install -r requirements.txt\n\n';
+      instructions += '# Run the application\n';
+      instructions += 'python main.py\n';
+      instructions += BACKTICKS + '\n';
+    } else if (projectInfo.type === 'flutter') {
+      instructions += BACKTICKS + 'bash\n';
+      instructions += '# Get dependencies\n';
+      instructions += 'flutter pub get\n\n';
+      instructions += '# Run on device/emulator\n';
+      instructions += 'flutter run\n\n';
+      instructions += '# Build for release\n';
+      instructions += 'flutter build apk  # Android\n';
+      instructions += 'flutter build ios  # iOS\n';
+      instructions += BACKTICKS + '\n';
+    } else if (projectInfo.type === 'ios') {
+      instructions += BACKTICKS + 'bash\n';
+      if (projectInfo.hasPods) {
+        instructions += '# Install dependencies\n';
+        instructions += 'pod install\n\n';
+        instructions += '# Open workspace\n';
+        instructions += 'open *.xcworkspace\n';
+      } else {
+        instructions += '# Open project\n';
+        instructions += 'open *.xcodeproj\n';
+      }
+      instructions += BACKTICKS + '\n\n';
+      instructions += 'Then press Cmd+R in Xcode to build and run.\n';
+    } else {
+      instructions += 'See ' + BACKTICK + 'NEXT_STEPS.md' + BACKTICK + ' for detailed setup instructions.\n';
+    }
+
+    return instructions;
+  }
+
+  // If there is already a substantial README, enhance it
+  if (existingReadme && existingReadme.length > 500) {
+    let enhanced = existingReadme;
+
+    // Check if README has actual running instructions
+    const hasRunInstructions = existingReadme.includes('npm run') ||
+      existingReadme.includes('npm start') ||
+      existingReadme.includes('yarn dev') ||
+      existingReadme.includes('pnpm dev') ||
+      existingReadme.includes('flutter run') ||
+      existingReadme.includes('python ') ||
+      existingReadme.includes('localhost:');
+
+    // If no running instructions, add Quick Start section
+    if (!hasRunInstructions && !existingReadme.includes('## Quick Start')) {
+      enhanced += getQuickStartInstructions();
+    }
+
+    // Add features section if not already there
+    if (!existingReadme.includes('## Features Implemented by Jake')) {
+      let featuresSection = '\n\n## Features Implemented by Jake\n\n';
+      featuresSection += 'The following features were automatically implemented:\n\n';
+      successfulStories.forEach(function(story) {
+        featuresSection += '- **' + story.title + '**: ' + story.description + '\n';
+      });
+      featuresSection += '\n---\n*Features implemented by [FluxGen](https://fluxgen.app) AI*\n';
+      enhanced += featuresSection;
+    }
+
+    return enhanced;
+  }
+
+  // Generate a new README
+  let content = '# ' + projectName + '\n\n';
+  content += description + '\n\n';
+
+  // Add badges based on project type
+  if (projectInfo.type === 'ios') {
+    content += '![Platform](https://img.shields.io/badge/platform-iOS-blue)\n';
+    content += '![Swift](https://img.shields.io/badge/Swift-5.0-orange)\n\n';
+  } else if (projectInfo.type === 'android') {
+    content += '![Platform](https://img.shields.io/badge/platform-Android-green)\n\n';
+  } else if (projectInfo.type === 'flutter') {
+    content += '![Platform](https://img.shields.io/badge/platform-iOS%20%7C%20Android-blue)\n';
+    content += '![Flutter](https://img.shields.io/badge/Flutter-3.0-blue)\n\n';
+  } else if (projectInfo.type === 'node') {
+    content += '![Node](https://img.shields.io/badge/node-18%2B-green)\n\n';
+  }
+
+  content += '## Features\n\n';
+  successfulStories.forEach(function(story) {
+    content += '- **' + story.title + '**: ' + story.description + '\n';
+  });
+  content += '\n';
+
+  content += '## Getting Started\n\n';
+  content += '### Prerequisites\n\n';
+
+  if (projectInfo.type === 'ios') {
+    content += '- macOS with Xcode 15+\n';
+    content += '- iOS 16+ deployment target\n';
+    if (projectInfo.hasPods) {
+      content += '- CocoaPods (' + BACKTICK + 'sudo gem install cocoapods' + BACKTICK + ')\n';
+    }
+    content += '\n### Installation\n\n';
+    content += BACKTICKS + 'bash\n';
+    content += '# Clone the repository\n';
+    content += 'git clone <repository-url>\n';
+    content += 'cd ' + (projectInfo.projectName || projectName) + '\n';
+    if (projectInfo.hasPods) {
+      content += '\n# Install dependencies\n';
+      content += 'pod install\n';
+      content += '\n# Open the workspace\n';
+      content += 'open ' + (projectInfo.projectName || projectName) + '.xcworkspace\n';
+    } else {
+      content += '\n# Open the project\n';
+      content += 'open ' + (projectInfo.projectName || projectName) + '.xcodeproj\n';
+    }
+    content += BACKTICKS + '\n\n';
+
+    content += '### Running the App\n\n';
+    content += '1. Open the project in Xcode\n';
+    content += '2. Select your target device (simulator or physical device)\n';
+    content += '3. Press Cmd+R or click the Run button\n\n';
+
+    content += '### Troubleshooting\n\n';
+    content += 'If you encounter issues opening the project, see ' + BACKTICK + 'NEXT_STEPS.md' + BACKTICK + ' for detailed troubleshooting steps.\n\n';
+
+  } else if (projectInfo.type === 'android') {
+    content += '- Android Studio (latest version)\n';
+    content += '- JDK 17+\n';
+    content += '- Android SDK with API level 33+\n\n';
+    content += '### Installation\n\n';
+    content += '1. Clone the repository\n';
+    content += '2. Open Android Studio\n';
+    content += '3. Select "Open an existing project"\n';
+    content += '4. Wait for Gradle sync to complete\n';
+    content += '5. Run on emulator or device\n\n';
+
+  } else if (projectInfo.type === 'flutter') {
+    content += '- Flutter SDK 3.0+\n';
+    content += '- Dart SDK\n';
+    content += '- Xcode (for iOS)\n';
+    content += '- Android Studio (for Android)\n\n';
+    content += '### Installation\n\n';
+    content += BACKTICKS + 'bash\n';
+    content += '# Clone the repository\n';
+    content += 'git clone <repository-url>\n';
+    content += 'cd ' + projectName.toLowerCase().replace(/\s+/g, '-') + '\n\n';
+    content += '# Get dependencies\n';
+    content += 'flutter pub get\n\n';
+    content += '# Run the app\n';
+    content += 'flutter run\n';
+    content += BACKTICKS + '\n\n';
+
+  } else if (projectInfo.type === 'react-native') {
+    content += '- Node.js 18+\n';
+    content += '- ' + (projectInfo.packageManager || 'npm') + '\n';
+    content += '- Xcode (for iOS)\n';
+    content += '- Android Studio (for Android)\n';
+    content += '- CocoaPods (for iOS)\n\n';
+    content += '### Installation\n\n';
+    content += BACKTICKS + 'bash\n';
+    content += '# Clone and install\n';
+    content += 'git clone <repository-url>\n';
+    content += 'cd ' + projectName.toLowerCase().replace(/\s+/g, '-') + '\n';
+    content += (projectInfo.packageManager || 'npm') + ' install\n\n';
+    content += '# iOS setup\n';
+    content += 'cd ios && pod install && cd ..\n\n';
+    content += '# Run iOS\n';
+    content += (projectInfo.packageManager || 'npm') + ' run ios\n\n';
+    content += '# Run Android\n';
+    content += (projectInfo.packageManager || 'npm') + ' run android\n';
+    content += BACKTICKS + '\n\n';
+
+  } else if (projectInfo.type === 'node') {
+    content += '- Node.js 18+ \n';
+    content += '- ' + (projectInfo.packageManager || 'npm') + '\n\n';
+    content += '### Installation\n\n';
+    content += BACKTICKS + 'bash\n';
+    content += '# Clone the repository\n';
+    content += 'git clone <repository-url>\n';
+    content += 'cd ' + projectName.toLowerCase().replace(/\s+/g, '-') + '\n\n';
+    content += '# Install dependencies\n';
+    content += projectInfo.installCmd || 'npm install';
+    content += '\n' + BACKTICKS + '\n\n';
+
+    content += '### Running\n\n';
+    content += BACKTICKS + 'bash\n';
+    content += '# Start development server\n';
+    content += (projectInfo.packageManager || 'npm') + ' run dev\n';
+    content += BACKTICKS + '\n\n';
+
+    content += '### Building for Production\n\n';
+    content += BACKTICKS + 'bash\n';
+    content += '# Build the application\n';
+    content += (projectInfo.packageManager || 'npm') + ' run build\n\n';
+    content += '# Start production server\n';
+    content += (projectInfo.packageManager || 'npm') + ' start\n';
+    content += BACKTICKS + '\n\n';
+
+  } else if (projectInfo.type === 'python') {
+    content += '- Python 3.8+\n';
+    content += '- pip or poetry\n\n';
+    content += '### Installation\n\n';
+    content += BACKTICKS + 'bash\n';
+    content += '# Clone the repository\n';
+    content += 'git clone <repository-url>\n';
+    content += 'cd ' + projectName.toLowerCase().replace(/\s+/g, '-') + '\n\n';
+    content += '# Create virtual environment\n';
+    content += 'python -m venv venv\n';
+    content += 'source venv/bin/activate  # On Windows: venv\\Scripts\\activate\n\n';
+    content += '# Install dependencies\n';
+    content += projectInfo.installCmd || 'pip install -r requirements.txt';
+    content += '\n' + BACKTICKS + '\n\n';
+
+    content += '### Running\n\n';
+    content += BACKTICKS + 'bash\n';
+    content += '# Run the application\n';
+    content += 'python main.py\n';
+    content += BACKTICKS + '\n\n';
+
+  } else {
+    content += '### Installation\n\n';
+    content += BACKTICKS + 'bash\n';
+    content += '# Clone the repository\n';
+    content += 'git clone <repository-url>\n\n';
+    content += '# Install dependencies (if applicable)\n';
+    content += '# Follow project-specific setup instructions\n';
+    content += BACKTICKS + '\n\n';
+  }
+
+  content += '## Next Steps\n\n';
+  content += 'See ' + BACKTICK + 'NEXT_STEPS.md' + BACKTICK + ' for:\n';
+  content += '- Detailed setup troubleshooting\n';
+  content += '- Deployment instructions\n';
+  content += '- Publishing to app stores\n';
+  content += '- Pre-launch checklist\n\n';
+
+  content += '## Contributing\n\n';
+  content += '1. Fork the repository\n';
+  content += '2. Create your feature branch (' + BACKTICK + 'git checkout -b feature/amazing-feature' + BACKTICK + ')\n';
+  content += '3. Commit your changes (' + BACKTICK + 'git commit -m ' + "'" + 'Add amazing feature' + "'" + BACKTICK + ')\n';
+  content += '4. Push to the branch (' + BACKTICK + 'git push origin feature/amazing-feature' + BACKTICK + ')\n';
+  content += '5. Open a Pull Request\n\n';
+
+  content += '## License\n\n';
+  content += 'This project is licensed under the MIT License - see the LICENSE file for details.\n\n';
+
+  content += '---\n';
+  content += '*Built with [FluxGen](https://fluxgen.app) - AI-Powered Feature Planning & Implementation*\n';
+
+  return content;
+}
+
+async function main() {
+  console.log('Jake AI Implementation Agent Starting...');
+  console.log('PRD:', JSON.stringify(PRD, null, 2));
+  await updateStatus('started', 'Jake is analyzing the codebase...');
+
+  const stories = PRD.stories || [];
+  if (stories.length === 0) {
+    await updateStatus('error', 'No stories found in PRD');
+    process.exit(1);
+  }
+
+  // Detect project type and install dependencies
+  const projectInfo = detectProjectType();
+  console.log('Detected project type: ' + projectInfo.type);
+  console.log('Check commands: ' + JSON.stringify(projectInfo.checkCmds));
+
+  if (projectInfo.installCmd) {
+    console.log('Installing dependencies: ' + projectInfo.installCmd);
+    await updateStatus('started', 'Installing dependencies...');
+    try {
+      execSync(projectInfo.installCmd, { stdio: 'inherit', timeout: 300000 });
+    } catch (e) {
+      console.log('Dependency install warning:', e.message);
+    }
+  }
+
+  // Check and resolve Next.js routing conflicts before proceeding
+  if (projectInfo.type === 'node') {
+    const nextJsConflicts = checkNextJsConflicts();
+    if (nextJsConflicts.length > 0) {
+      console.log('Found ' + nextJsConflicts.length + ' Next.js routing conflicts');
+      resolveNextJsConflicts(nextJsConflicts);
+    }
+  }
+
+  console.log('Building codebase context...');
+  const codebaseContext = buildCodebaseContext();
+
+  const branchName = 'jake/feature-' + Date.now();
+  execSync('git checkout -b ' + branchName);
+  console.log('Created branch: ' + branchName);
+
+  execSync('git config user.name "Jake AI Agent"');
+  execSync('git config user.email "jake@fluxgen.app"');
+
+  const systemPrompt = 'You are Jake, an expert AI software engineer. You implement features by writing clean, production-ready code.\n\nIMPORTANT RULES:\n1. Output file changes in this EXACT format:\n   ' + BACKTICKS + 'language\n   // FILE: path/to/file.ext\n   <complete file content>\n   ' + BACKTICKS + '\n2. Always include the COMPLETE file content, not just changes\n3. Follow existing code patterns and conventions in the codebase EXACTLY\n4. Check existing theme/style files before using any variables\n5. Write clean, well-documented code\n6. Handle errors appropriately\n7. Include necessary imports\n8. If creating new files, use appropriate directory structure\n9. CRITICAL: Verify all imports and variable references exist in the codebase\n\n**DEPENDENCY MANAGEMENT - VERY IMPORTANT:**\n10. If you use ANY npm package that is NOT already in package.json, you MUST also update package.json to add it\n11. Check package.json dependencies before using any import - if the package is not listed, ADD IT\n12. When adding dependencies, use appropriate versions (latest stable)\n13. ALWAYS include package.json in your file changes if you add new imports\n14. For TypeScript projects, add both the package AND @types/package if needed\n\n**PROJECT STRUCTURE:**\n15. NEVER mix different frameworks (e.g., do not create both React and Flutter files)\n16. Stick to ONE technology stack based on what already exists in the project\n17. If starting fresh, choose the simplest appropriate stack for the requirement\n\n**NEXT.JS SPECIFIC - CRITICAL:**\n18. NEVER create both pages/ and app/ router files - pick ONE routing approach\n19. If app/ directory exists, use App Router ONLY (app/page.tsx, app/layout.tsx, etc.)\n20. If pages/ directory exists without app/, use Pages Router ONLY (pages/index.tsx, pages/_app.tsx, etc.)\n21. NEVER create pages/index.tsx if app/page.tsx exists (or vice versa) - this causes build failures\n22. For new Next.js projects, prefer App Router (app/ directory) as it is the modern approach';
+
+  let completedStories = 0;
+  const successfulStories = [];
+  const failedStories = [];
+
+  for (const story of stories) {
+    console.log('\nImplementing story: ' + story.id + ' - ' + story.title);
+    await updateStatus('implementing', 'Working on: ' + story.title, story.id);
+
+    let prompt = '## Task\nImplement the following user story:\n\n**' + story.id + ': ' + story.title + '**\n' + story.description + '\n\n**Acceptance Criteria:**\n' + (story.acceptance_criteria || []).map(function(c) { return '- ' + c; }).join('\n') + '\n\n' + codebaseContext + '\n\n## Instructions\nAnalyze the codebase and implement this feature. Output ALL file changes needed using the format:\n' + BACKTICKS + 'language\n// FILE: path/to/file.ext\n<complete file content>\n' + BACKTICKS + '\n\nBe thorough and implement the complete feature.';
+
+    let attempts = 0;
+    let success = false;
+
+    while (attempts < MAX_FIX_ATTEMPTS && !success) {
+      attempts++;
+      console.log('\nAttempt ' + attempts + '/' + MAX_FIX_ATTEMPTS);
+
+      try {
+        const response = await callAI(prompt, systemPrompt);
+        console.log('AI Response received, parsing changes...');
+
+        const changes = parseFileChanges(response);
+        console.log('Found ' + changes.length + ' file changes');
+
+        if (changes.length === 0) {
+          console.log('No changes parsed from response');
+          break;
+        }
+
+        applyChanges(changes);
+
+        // Check if package.json was modified - if so, reinstall dependencies
+        const packageJsonChanged = changes.some(function(c) { return c.path === 'package.json' || c.path.endsWith('/package.json'); });
+        if (packageJsonChanged && projectInfo.installCmd) {
+          console.log('package.json modified - reinstalling dependencies...');
+          try {
+            execSync(projectInfo.installCmd, { stdio: 'inherit', timeout: 300000 });
+          } catch (e) {
+            console.log('Dependency install warning:', e.message);
+          }
+        }
+
+        // Check and resolve any Next.js routing conflicts that may have been created
+        if (projectInfo.type === 'node') {
+          const nextJsConflicts = checkNextJsConflicts();
+          if (nextJsConflicts.length > 0) {
+            console.log('Resolving Next.js routing conflicts created during implementation...');
+            resolveNextJsConflicts(nextJsConflicts);
+          }
+        }
+
+        // Run checks if we have any configured
+        if (projectInfo.checkCmds.length > 0) {
+          await updateStatus('verifying', 'Running all checks: ' + projectInfo.checkCmds.join(', '), story.id);
+          const errors = runChecks(projectInfo);
+
+          // Count total error lines for better reporting
+          const totalErrorLines = errors.reduce(function(sum, e) {
+            return sum + (e.output.match(/error/gi) || []).length;
+          }, 0);
+
+          if (errors.length > 0) {
+            console.log('\nBuild errors found from ' + errors.length + ' check(s):');
+            errors.forEach(function(e) { console.log(e.command + ':\n' + e.output); });
+
+            if (attempts < MAX_FIX_ATTEMPTS) {
+              await updateStatus('fixing', 'Found ~' + totalErrorLines + ' errors. Fixing ALL issues (attempt ' + attempts + '/' + MAX_FIX_ATTEMPTS + ')...', story.id);
+
+              // Build fix prompt with error context
+              const errorContext = errors.map(function(e) {
+                return '### Command: ' + e.command + '\n' + BACKTICKS + '\n' + e.output + '\n' + BACKTICKS;
+              }).join('\n\n');
+
+              // Read the files that were just modified for context
+              const modifiedFilesContext = changes.map(function(c) {
+                return '### ' + c.path + '\n' + BACKTICKS + '\n' + readFileContent(c.path) + '\n' + BACKTICKS;
+              }).join('\n\n');
+
+              // Find and read related files based on error patterns
+              const relatedFiles = findRelatedFiles(errors, changes);
+              const relatedFilesContext = relatedFiles.map(function(f) {
+                return '### ' + f + ' (reference)\n' + BACKTICKS + '\n' + readFileContent(f) + '\n' + BACKTICKS;
+              }).join('\n\n');
+
+              // Detect missing module errors
+              const allErrorText = errors.map(function(e) { return e.output; }).join('\n');
+              const missingModules = [];
+              const moduleRegex = /Cannot find module ['"]([^'"]+)['"]|Module not found.*['"]([^'"]+)['"]/g;
+              let match;
+              while ((match = moduleRegex.exec(allErrorText)) !== null) {
+                const moduleName = match[1] || match[2];
+                if (moduleName && !moduleName.startsWith('.') && !moduleName.startsWith('/')) {
+                  missingModules.push(moduleName.split('/')[0].replace(/^@/, '@' + moduleName.split('/')[1]));
+                }
+              }
+              const uniqueMissingModules = [...new Set(missingModules)];
+
+              // Always include package.json context for dependency issues
+              let packageJsonContext = '';
+              if (fs.existsSync('package.json')) {
+                packageJsonContext = '### Current package.json\n' + BACKTICKS + 'json\n' + readFileContent('package.json') + '\n' + BACKTICKS + '\n\n';
+              }
+
+              let missingModuleInstructions = '';
+              if (uniqueMissingModules.length > 0) {
+                missingModuleInstructions = '\n\n## MISSING DEPENDENCIES DETECTED:\n' +
+                  'The following packages are imported but NOT in package.json:\n' +
+                  uniqueMissingModules.map(function(m) { return '- ' + m; }).join('\n') + '\n\n' +
+                  '**YOU MUST add these to package.json dependencies with appropriate versions.**\n' +
+                  'Example: "' + uniqueMissingModules[0] + '": "^1.0.0"\n' +
+                  'For TypeScript, also add @types packages if needed.\n';
+              }
+
+              prompt = '## CRITICAL: FIX ALL ERRORS - ATTEMPT ' + attempts + '/' + MAX_FIX_ATTEMPTS + '\n\n' +
+                '**You MUST fix EVERY error below before I run checks again.**\n' +
+                '**Do NOT leave any errors unfixed. Be thorough and diligent.**\n\n' +
+                '## ALL Build/Lint/Type Errors (fix ALL of these):\n' + errorContext + '\n\n' +
+                packageJsonContext +
+                '## Your Current Files (containing errors):\n' + modifiedFilesContext + '\n\n' +
+                (relatedFilesContext ? '## Reference Files From Codebase (use these for correct patterns, imports, types):\n' + relatedFilesContext + '\n\n' : '') +
+                missingModuleInstructions +
+                '## Original Task:\n**' + story.id + ': ' + story.title + '**\n' + story.description + '\n\n' +
+                '## FIX INSTRUCTIONS - READ CAREFULLY:\n\n' +
+                '1. **Go through EACH error one by one** - do not skip any\n' +
+                '2. **"Cannot find module" errors**: ADD the missing package to package.json dependencies\n' +
+                '3. **Import errors**: Verify the exact export name exists in the source file\n' +
+                '4. **Property undefined errors**: The property does NOT exist - look at reference files for the REAL property names\n' +
+                '5. **Type errors**: Match the exact types from the codebase, add @types packages if needed\n' +
+                '6. **ESLint config errors**: Fix the .eslintrc.json configuration\n' +
+                '7. **Do NOT invent or assume** - only use what exists in reference files\n' +
+                '8. **ALWAYS include package.json** if you are adding any new dependencies\n\n' +
+                '**Output ALL corrected files using this format:**\n' + BACKTICKS + 'language\n// FILE: path/to/file.ext\n<complete file content>\n' + BACKTICKS + '\n\n' +
+                '**IMPORTANT: I will reinstall dependencies and run checks again after your response. Make sure ALL errors are fixed!**';
+
+              continue; // Try again
+            }
+          } else {
+            console.log('All checks passed!');
+            success = true;
+          }
+        } else {
+          // No checks configured, assume success
+          success = true;
+        }
+
+      } catch (error) {
+        console.error('Error on attempt ' + attempts + ':', error.message);
+        if (attempts >= MAX_FIX_ATTEMPTS) {
+          await updateStatus('error', 'Failed to implement ' + story.id + ' after ' + attempts + ' attempts: ' + error.message, story.id);
+        }
+      }
+    }
+
+    if (success) {
+      execSync('git add -A');
+      const commitMsg = 'feat(' + story.id + '): ' + story.title + '\n\nImplemented by Jake AI Agent\n\nAcceptance Criteria:\n' + (story.acceptance_criteria || []).map(function(c) { return '- ' + c; }).join('\n');
+      execSync('git commit -m "' + commitMsg.replace(/"/g, '\\"') + '"', { stdio: 'inherit' });
+      console.log('Committed changes for ' + story.id);
+
+      completedStories++;
+      successfulStories.push(story);
+      await updateStatus('progress', 'Completed ' + completedStories + '/' + stories.length + ' stories (verified)', story.id);
+    } else {
+      // Revert uncommitted changes for this story
+      console.log('Reverting changes for failed story ' + story.id);
+      execSync('git checkout -- .', { stdio: 'inherit' });
+      failedStories.push(story);
+      await updateStatus('error', 'Failed to implement ' + story.id + ' after ' + MAX_FIX_ATTEMPTS + ' attempts', story.id);
+    }
+  }
+
+  if (completedStories === 0) {
+    await updateStatus('error', 'No stories were successfully implemented. Please check the error messages and try again.');
+    process.exit(1);
+  }
+
+  // Run final comprehensive build check to catch any cross-story issues
+  console.log('\nRunning final build verification...');
+  await updateStatus('verifying', 'Running final build check across all changes...');
+
+  if (projectInfo.checkCmds.length > 0) {
+    // Ensure all dependencies are installed
+    if (projectInfo.installCmd) {
+      try {
+        console.log('Ensuring all dependencies are installed...');
+        execSync(projectInfo.installCmd, { stdio: 'inherit', timeout: 300000 });
+      } catch (e) {
+        console.log('Dependency install warning:', e.message);
+      }
+    }
+
+    const finalErrors = runChecks(projectInfo);
+    if (finalErrors.length > 0) {
+      console.log('\nFinal build check found errors:');
+      finalErrors.forEach(function(e) { console.log(e.command + ':\n' + e.output); });
+      await updateStatus('error', 'Project has build errors. ' + completedStories + ' stories implemented but final build failed.');
+      // Don't exit - still create PR so user can see the work and fix manually
+    } else {
+      console.log('Final build check passed!');
+    }
+  }
+
+  // Generate documentation files
+  console.log('\nGenerating documentation...');
+  await updateStatus('implementing', 'Generating project documentation...');
+
+  try {
+    // Generate NEXT_STEPS.md
+    const nextStepsContent = generateNextSteps(PRD, projectInfo, successfulStories, failedStories);
+    fs.writeFileSync('NEXT_STEPS.md', nextStepsContent);
+    console.log('Created NEXT_STEPS.md');
+
+    // Generate or update README.md
+    const readmeExists = fs.existsSync('README.md');
+    const existingReadme = readmeExists ? fs.readFileSync('README.md', 'utf-8') : '';
+    const readmeContent = await generateReadme(PRD, projectInfo, successfulStories, existingReadme);
+    fs.writeFileSync('README.md', readmeContent);
+    console.log(readmeExists ? 'Updated README.md' : 'Created README.md');
+
+    // Commit documentation
+    execSync('git add NEXT_STEPS.md README.md');
+    execSync('git commit -m "docs: Add project documentation\n\nGenerated by Jake AI Agent"', { stdio: 'inherit' });
+    console.log('Committed documentation');
+  } catch (docError) {
+    console.log('Warning: Could not generate documentation:', docError.message);
+  }
+
+  console.log('\nPushing changes...');
+  execSync('git push origin ' + branchName, { stdio: 'inherit' });
+
+  console.log('Creating pull request...');
+  const prTitle = PRD.project_name || 'Feature Implementation by Jake';
+
+  // Build PR body with success/failure info
+  let prBody = '## AI-Generated Feature Implementation\n\nThis PR was automatically generated by **Jake**, the FluxGen AI agent.\n\n';
+
+  prBody += '### Stories Implemented (' + successfulStories.length + '/' + stories.length + ')\n';
+  prBody += successfulStories.map(function(s) { return '- [x] **' + s.id + '**: ' + s.title; }).join('\n');
+
+  if (failedStories.length > 0) {
+    prBody += '\n\n### Stories Needing Manual Attention (' + failedStories.length + ')\n';
+    prBody += failedStories.map(function(s) { return '- [ ] **' + s.id + '**: ' + s.title + ' (build errors after ' + MAX_FIX_ATTEMPTS + ' attempts)'; }).join('\n');
+    prBody += '\n\n> **Note:** Some stories could not be implemented automatically due to build errors. Please review and complete manually.';
+  }
+
+  prBody += '\n\n### Verification\n';
+  if (failedStories.length === 0) {
+    prBody += 'All implemented stories passed build/lint/typecheck verification.';
+  } else {
+    prBody += 'Successfully implemented stories passed verification. Failed stories were reverted.';
+  }
+
+  prBody += '\n\n### Documentation\n';
+  prBody += 'This PR includes automatically generated documentation:\n';
+  prBody += '- ' + BACKTICK + 'README.md' + BACKTICK + ' - Project overview and setup instructions\n';
+  prBody += '- ' + BACKTICK + 'NEXT_STEPS.md' + BACKTICK + ' - Deployment guide and next steps\n';
+
+  prBody += '\n### Summary\n' + (PRD.description || 'Implemented requested features based on the PRD.');
+  prBody += '\n\n---\n*Generated with [FluxGen](https://fluxgen.app) - AI-Powered Feature Planning & Implementation*';
+
+  let prUrl = '';
+  try {
+    const result = execSync('gh pr create --title "' + prTitle + '" --body "' + prBody.replace(/"/g, '\\"') + '"', { encoding: 'utf-8' });
+    console.log('PR created:', result);
+    // Extract PR URL from output - gh cli outputs the URL on the last line
+    const lines = result.trim().split('\n');
+    for (let line of lines) {
+      const urlMatch = line.match(/https:\/\/github\.com\/[^\s]+\/pull\/\d+/);
+      if (urlMatch) {
+        prUrl = urlMatch[0];
+        break;
+      }
+    }
+    // If no URL found in expected format, try the last line
+    if (!prUrl && lines.length > 0) {
+      const lastLine = lines[lines.length - 1].trim();
+      if (lastLine.includes('github.com') && lastLine.includes('/pull/')) {
+        prUrl = lastLine;
+      }
+    }
+
+    // Auto-merge the PR if all stories passed and no build errors
+    if (prUrl && failedStories.length === 0) {
+      console.log('\nAuto-merging PR...');
+      try {
+        execSync('gh pr merge "' + prUrl + '" --merge --delete-branch', { stdio: 'inherit' });
+        console.log('PR merged successfully!');
+        await updateStatus('completed', 'Implementation complete! ' + completedStories + ' stories merged to main.', null, prUrl);
+      } catch (mergeError) {
+        console.log('Auto-merge failed (may require review):', mergeError.message);
+        const statusMsg = 'PR created with ' + completedStories + ' stories. Auto-merge failed - may require review.';
+        await updateStatus('completed', statusMsg, null, prUrl);
+      }
+    } else {
+      const statusMsg = failedStories.length > 0
+        ? 'PR created with ' + completedStories + '/' + stories.length + ' stories. ' + failedStories.length + ' stories need manual attention.'
+        : 'PR created successfully! All ' + completedStories + ' stories implemented and verified.';
+      await updateStatus('completed', statusMsg, null, prUrl || null);
+    }
+  } catch (e) {
+    console.log('PR creation output:', e.message);
+    // Try to extract PR URL from error message (gh sometimes puts it there)
+    const urlMatch = e.message.match(/https:\/\/github\.com\/[^\s]+\/pull\/\d+/);
+    prUrl = urlMatch ? urlMatch[0] : '';
+
+    // Only send prUrl if it's actually a valid PR URL, not a branch name
+    const validPrUrl = prUrl && prUrl.includes('/pull/') ? prUrl : null;
+
+    // Try to auto-merge if we got a valid PR URL
+    if (validPrUrl && failedStories.length === 0) {
+      try {
+        execSync('gh pr merge "' + validPrUrl + '" --merge --delete-branch', { stdio: 'inherit' });
+        console.log('PR merged successfully!');
+        await updateStatus('completed', 'Implementation complete! ' + completedStories + ' stories merged to main.', null, validPrUrl);
+      } catch (mergeError) {
+        console.log('Auto-merge failed:', mergeError.message);
+        const statusMsg = 'PR created! ' + completedStories + '/' + stories.length + ' stories implemented.';
+        await updateStatus('completed', statusMsg, null, validPrUrl);
+      }
+    } else {
+      const statusMsg = validPrUrl
+        ? 'PR created! ' + completedStories + '/' + stories.length + ' stories implemented.'
+        : 'Changes pushed to branch ' + branchName + '. ' + completedStories + '/' + stories.length + ' stories implemented. Create a PR manually to merge.';
+      await updateStatus('completed', statusMsg, null, validPrUrl);
+    }
+  }
+}
+
+main().catch(async (error) => {
+  console.error('Fatal error:', error);
+  await updateStatus('error', 'Fatal error: ' + error.message);
+  process.exit(1);
+});

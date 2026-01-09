@@ -1,0 +1,38 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Content {
+  id          String   @id @default(cuid())
+  title       String
+  description String?
+  content     String
+  type        ContentType
+  status      ContentStatus @default(DRAFT)
+  imageUrl    String?
+  slug        String   @unique
+  tags        String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  @@map("contents")
+}
+
+enum ContentType {
+  PORTFOLIO
+  BLOG_POST
+  SERVICE
+  TESTIMONIAL
+  ABOUT
+}
+
+enum ContentStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
