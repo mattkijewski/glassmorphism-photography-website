@@ -1,6 +1,3 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
 generator client {
   provider = "prisma-client-js"
 }
@@ -10,126 +7,32 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-model User {
-  id        String   @id @default(cuid())
-  email     String   @unique
-  name      String?
-  role      Role     @default(CLIENT)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-  
-  // Relations
-  bookings  Booking[]
-  inquiries Inquiry[]
-  
-  @@map("users")
-}
-
-model Gallery {
+model Content {
   id          String   @id @default(cuid())
   title       String
   description String?
+  content     String
+  type        ContentType
+  status      ContentStatus @default(DRAFT)
+  imageUrl    String?
   slug        String   @unique
-  isPublished Boolean  @default(false)
+  tags        String?
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
   
-  // Relations
-  images      Image[]
-  
-  @@map("galleries")
+  @@map("contents")
 }
 
-model Image {
-  id          String   @id @default(cuid())
-  title       String
-  description String?
-  url         String
-  thumbnailUrl String?
-  alt         String
-  width       Int
-  height      Int
-  fileSize    Int?
-  order       Int      @default(0)
-  isPublished Boolean  @default(true)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-  
-  // Relations
-  galleryId   String?
-  gallery     Gallery? @relation(fields: [galleryId], references: [id], onDelete: Cascade)
-  
-  @@map("images")
+enum ContentType {
+  PORTFOLIO
+  BLOG_POST
+  SERVICE
+  TESTIMONIAL
+  ABOUT
 }
 
-model Service {
-  id          String   @id @default(cuid())
-  name        String
-  description String
-  price       Float?
-  duration    Int?     // in minutes
-  isActive    Boolean  @default(true)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-  
-  // Relations
-  bookings    Booking[]
-  
-  @@map("services")
-}
-
-model Booking {
-  id           String        @id @default(cuid())
-  date         DateTime
-  time         String
-  status       BookingStatus @default(PENDING)
-  notes        String?
-  totalAmount  Float?
-  createdAt    DateTime      @default(now())
-  updatedAt    DateTime      @updatedAt
-  
-  // Relations
-  userId       String
-  user         User          @relation(fields: [userId], references: [id])
-  serviceId    String
-  service      Service       @relation(fields: [serviceId], references: [id])
-  
-  @@map("bookings")
-}
-
-model Inquiry {
-  id        String   @id @default(cuid())
-  subject   String
-  message   String
-  isRead    Boolean  @default(false)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-  
-  // Relations
-  userId    String?
-  user      User?    @relation(fields: [userId], references: [id])
-  
-  @@map("inquiries")
-}
-
-model Settings {
-  id        String   @id @default(cuid())
-  key       String   @unique
-  value     String
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-  
-  @@map("settings")
-}
-
-enum Role {
-  ADMIN
-  CLIENT
-}
-
-enum BookingStatus {
-  PENDING
-  CONFIRMED
-  CANCELLED
-  COMPLETED
+enum ContentStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
 }
