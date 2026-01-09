@@ -1,6 +1,12 @@
-export const metadata = {
-  title: 'Glassmorphism Photography',
-  description: 'Modern photography website with glassmorphism design',
+import type { Metadata } from 'next'
+import { Inter } from 'next/font/google'
+import './globals.css'
+
+const inter = Inter({ subsets: ['latin'] })
+
+export const metadata: Metadata = {
+  title: 'Glassmorphism Photography Studio',
+  description: 'Professional photography services with modern glassmorphism design',
 }
 
 export default function RootLayout({
@@ -10,7 +16,9 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en">
-      <body>{children}</body>
+      <body className={inter.className}>
+        {children}
+      </body>
     </html>
   )
 }
