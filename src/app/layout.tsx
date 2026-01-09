@@ -7,6 +7,7 @@ const inter = Inter({ subsets: ['latin'] })
 export const metadata: Metadata = {
   title: 'Glassmorphism Photography Studio',
   description: 'Professional photography services with modern glassmorphism design',
+  keywords: ['photography', 'professional', 'booking', 'consultation', 'glassmorphism'],
 }
 
 export default function RootLayout({
@@ -17,7 +18,9 @@ export default function RootLayout({
   return (
     <html lang="en">
       <body className={inter.className}>
-        {children}
+        <div className="min-h-screen bg-gradient-to-br from-blue-900 via-purple-900 to-indigo-900">
+          {children}
+        </div>
       </body>
     </html>
   )
