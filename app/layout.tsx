@@ -5,8 +5,8 @@ import { Inter } from 'next/font/google'
 const inter = Inter({ subsets: ['latin'] })
 
 export const metadata: Metadata = {
-  title: 'Matthew Kijewski Photography',
-  description: 'Professional photography services by Matthew Kijewski',
+  title: 'Glassmorphism Photography | Professional Wedding & Event Photography',
+  description: 'Capturing life\'s most precious moments with a modern, elegant approach. Specializing in weddings and events photography.',
 }
 
 export default function RootLayout({
