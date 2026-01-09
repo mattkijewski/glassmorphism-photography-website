@@ -1,11 +1,7 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  images: {
-    domains: ['images.unsplash.com', 'unsplash.com'],
-    formats: ['image/webp', 'image/avif'],
-  },
   experimental: {
-    optimizeCss: true,
+    appDir: true,
   },
 }
 

@@ -1,14 +1,13 @@
-import type { Metadata } from 'next'
-import { Inter } from 'next/font/google'
 import './globals.css'
-import { ThemeProvider } from '@/components/providers/ThemeProvider'
+import { Inter } from 'next/font/google'
+import Header from './components/Header'
+import Footer from './components/Footer'
 
 const inter = Inter({ subsets: ['latin'] })
 
-export const metadata: Metadata = {
-  title: 'Photography Studio | Premium Photography Services',
-  description: 'Professional photography services specializing in portraits, weddings, events, and commercial photography. Capturing moments that matter.',
-  keywords: ['photography', 'photographer', 'portrait', 'wedding', 'event', 'commercial'],
+export const metadata = {
+  title: 'Photography Studio - Professional Photography Services',
+  description: 'Professional photography services with a modern glassmorphism design. Book your session today.',
 }
 
 export default function RootLayout({
@@ -17,16 +16,11 @@ export default function RootLayout({
   children: React.ReactNode
 }) {
   return (
-    <html lang="en" suppressHydrationWarning>
+    <html lang="en">
       <body className={inter.className}>
-        <ThemeProvider
-          attribute="class"
-          defaultTheme="light"
-          enableSystem
-          disableTransitionOnChange
-        >
-          {children}
-        </ThemeProvider>
+        <Header />
+        <main>{children}</main>
+        <Footer />
       </body>
     </html>
   )
