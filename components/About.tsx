@@ -1,78 +1,45 @@
-'use client'
-
-import { useState, useEffect } from 'react'
-
-export function About() {
-  const [mounted, setMounted] = useState(false)
-
-  useEffect(() => {
-    setMounted(true)
-  }, [])
-
-  if (!mounted) return null
-
+export default function About() {
   return (
-    <section className="py-20 px-6 bg-gradient-to-b from-gray-900 to-black">
-      <div className="max-w-7xl mx-auto">
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-12 items-center">
-          {/* Content */}
-          <div className="animate-slide-up">
-            <h2 className="text-4xl md:text-5xl font-bold text-white mb-6">
-              About Our Studio
+    <section className="py-20 px-4">
+      <div className="max-w-6xl mx-auto">
+        <div className="glass-effect p-12">
+          <div className="text-center mb-12">
+            <h2 className="text-4xl md:text-5xl font-bold text-white mb-4">
+              About Matthew Kijewski
             </h2>
-            <p className="text-xl text-white/70 mb-8 leading-relaxed">
-              With over a decade of experience in photography, we specialize in creating 
-              stunning visual narratives that capture the essence of every moment.
-            </p>
-            <div className="space-y-6">
-              <div className="flex items-start space-x-4">
-                <div className="glass w-12 h-12 rounded-full flex items-center justify-center flex-shrink-0">
-                  <span className="text-blue-400">📸</span>
-                </div>
-                <div>
-                  <h3 className="text-white font-semibold mb-2">Professional Equipment</h3>
-                  <p className="text-white/60">
-                    State-of-the-art cameras and lighting equipment for perfect shots
-                  </p>
-                </div>
-              </div>
-              
-              <div className="flex items-start space-x-4">
-                <div className="glass w-12 h-12 rounded-full flex items-center justify-center flex-shrink-0">
-                  <span className="text-purple-400">✨</span>
-                </div>
-                <div>
-                  <h3 className="text-white font-semibold mb-2">Creative Vision</h3>
-                  <p className="text-white/60">
-                    Unique artistic approach to bring your vision to life
-                  </p>
-                </div>
-              </div>
-              
-              <div className="flex items-start space-x-4">
-                <div className="glass w-12 h-12 rounded-full flex items-center justify-center flex-shrink-0">
-                  <span className="text-green-400">⚡</span>
-                </div>
-                <div>
-                  <h3 className="text-white font-semibold mb-2">Quick Turnaround</h3>
-                  <p className="text-white/60">
-                    Fast delivery of professionally edited photos
-                  </p>
-                </div>
-              </div>
-            </div>
+            <div className="w-24 h-1 bg-gradient-to-r from-blue-400 to-purple-400 mx-auto rounded-full"></div>
           </div>
-
-          {/* Image placeholder */}
-          <div className="animate-fade-in delay-300">
-            <div className="glass rounded-3xl p-8 aspect-square flex items-center justify-center">
-              <div className="text-center text-white/60">
-                <div className="w-24 h-24 mx-auto mb-6 bg-white/10 rounded-full flex items-center justify-center text-4xl">
-                  📷
-                </div>
-                <h3 className="text-2xl font-semibold mb-4">Studio Preview</h3>
-                <p>Professional photography studio space</p>
-              </div>
+          
+          <div className="grid md:grid-cols-2 gap-12 items-center">
+            <div>
+              <p className="text-lg text-white text-opacity-90 leading-relaxed mb-6">
+                With over a decade of experience in professional photography, Matthew Kijewski 
+                specializes in capturing the essence of every moment. From intimate portraits 
+                to grand landscapes, every shot tells a unique story.
+              </p>
+              <p className="text-lg text-white text-opacity-90 leading-relaxed">
+                Based in the heart of creativity, Matthew brings a fresh perspective to 
+                traditional photography, combining technical expertise with artistic vision 
+                to create truly memorable images.
+              </p>
+            </div>
+            
+            <div className="glass-effect p-8">
+              <h3 className="text-2xl font-bold text-white mb-6">Specialties</h3>
+              <ul className="space-y-3">
+                {[
+                  'Portrait Photography',
+                  'Wedding Photography',
+                  'Landscape Photography',
+                  'Commercial Photography',
+                  'Event Photography'
+                ].map((specialty, index) => (
+                  <li key={index} className="flex items-center text-white text-opacity-90">
+                    <div className="w-2 h-2 bg-gradient-to-r from-blue-400 to-purple-400 rounded-full mr-3"></div>
+                    {specialty}
+                  </li>
+                ))}
+              </ul>
             </div>
           </div>
         </div>
