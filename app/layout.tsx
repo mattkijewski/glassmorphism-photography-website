@@ -1,13 +1,12 @@
-import './globals.css'
+import type { Metadata } from 'next'
 import { Inter } from 'next/font/google'
-import Header from './components/Header'
-import Footer from './components/Footer'
+import './globals.css'
 
 const inter = Inter({ subsets: ['latin'] })
 
-export const metadata = {
-  title: 'Photography Studio - Professional Photography Services',
-  description: 'Professional photography services with a modern glassmorphism design. Book your session today.',
+export const metadata: Metadata = {
+  title: 'Elite Photography Studio - Professional Photography Services',
+  description: 'Professional photography services with a modern touch. Book your session today.',
 }
 
 export default function RootLayout({
@@ -18,9 +17,7 @@ export default function RootLayout({
   return (
     <html lang="en">
       <body className={inter.className}>
-        <Header />
-        <main>{children}</main>
-        <Footer />
+        {children}
       </body>
     </html>
   )
